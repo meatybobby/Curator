@@ -21,20 +21,31 @@ import http.server
 import io
 import json
 import socketserver
+import sys
 import urllib.parse
+from pathlib import Path
 
 import pandas as pd
 
+# Sibling module (no nemo_curator); allow running from repo root or this directory.
+_script_dir = Path(__file__).resolve().parent
+if str(_script_dir) not in sys.path:
+    sys.path.insert(0, str(_script_dir))
+
 try:
-    from PIL import Image
+    from PIL import Image  # noqa: E402
 except ImportError:
     Image = None
 
-from nemo_curator.stages.interleaved.io.readers.webdataset import WebdatasetReaderStage
-from nemo_curator.stages.interleaved.utils import materialize_task_binary_content
-from nemo_curator.stages.interleaved.utils.constants import DEFAULT_JSON_EXTENSIONS, DEFAULT_WEBDATASET_EXTENSIONS
-from nemo_curator.tasks import FileGroupTask, InterleavedBatch
-from nemo_curator.utils.file_utils import get_all_file_paths_under
+from preview_annotation_standalone import (  # noqa: E402
+    DEFAULT_JSON_EXTENSIONS,
+    DEFAULT_WEBDATASET_EXTENSIONS,
+    FileGroupTask,
+    InterleavedBatch,
+    WebdatasetReaderStage,
+    get_all_file_paths_under,
+    materialize_task_binary_content,
+)
 
 LIMIT_SAMPLES = 50
 MAX_TARS = 30

@@ -149,20 +149,20 @@ def build_pipeline(args: argparse.Namespace) -> Pipeline:
     )
     # Add one annotation filter stage per filter; annotation is intersected across stages
     # pipe.add_stage(InterleavedAnnotationFilterStage(filter_stage=InterleavedBlurFilterStage()))
-    # pipe.add_stage(InterleavedAnnotationFilterStage(filter_stage=InterleavedQRCodeFilterStage()))
+    pipe.add_stage(InterleavedAnnotationFilterStage(filter_stage=InterleavedQRCodeFilterStage()))
     # pipe.add_stage(
     #     InterleavedAnnotationFilterStage(
-    #         filter_stage=InterleavedCLIPScoreFilterStage(model_dir="./model", min_score=0.15)
+    #         filter_stage=InterleavedCLIPScoreFilterStage(model_dir="./model_weights", min_score=0.15)
     #     )
     # )
-    pipe.add_stage(
-        InterleavedAnnotationFilterStage(
-            filter_stage=InterleavedImageToTextRatioFilterStage(
-                min_ratio=0.001,
-                max_ratio=2,
-            )
-        )
-    )
+    # pipe.add_stage(
+    #     InterleavedAnnotationFilterStage(
+    #         filter_stage=InterleavedImageToTextRatioFilterStage(
+    #             min_ratio=0.001,
+    #             max_ratio=2,
+    #         )
+    #     )
+    # )
     pipe.add_stage(
         InterleavedAnnotationParquetWriterStage(
             path=args.output_path,
