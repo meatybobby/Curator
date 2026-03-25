@@ -12,9 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Pipeline that runs the same filters as mint1t_mvp_pipeline but saves only annotation
-information (sample_id, original position) for kept rows. Position is the original index
-so preview/restore can match rows to the original dataset without re-running the filter.
+"""Pipeline that runs the same filters as mint1t_mvp_pipeline but saves annotation rows
+for every content (sample_id, original position) with a cumulative ``keep_mask`` boolean.
+Downstream tools can compute filtered vs kept counts from parquet alone without re-scanning
+the WebDataset input. Position is the original index so preview/restore can match rows
+to the original dataset without re-running the filter.
 """
 
 import argparse
@@ -36,18 +38,62 @@ from nemo_curator.utils.client_utils import is_remote_url
 from nemo_curator.utils.file_utils import check_output_mode
 from nemo_curator.stages.interleaved.filter import (
     InterleavedBlurFilterStage,
-    InterleavedQRCodeFilterStage,
     InterleavedCLIPScoreFilterStage,
     InterleavedImageToTextRatioFilterStage,
+    InterleavedQRCodeFilterStage,
 )
 
 ANNOTATION_METADATA_KEY = "annotation"
 
+FILTER_CHOICES = ("blur", "qrcode", "clip", "ratio")
+CLIP_MODEL_DIR = "./model_weights"
+
+
+def add_annotation_filters(pipe: Pipeline, args: argparse.Namespace) -> None:
+    """Append InterleavedAnnotationFilterStage instances in the order given by --filters."""
+    for name in args.filters:
+        if name == "blur":
+            score = args.score if args.score is not None else 100.0
+            pipe.add_stage(
+                InterleavedAnnotationFilterStage(
+                    filter_stage=InterleavedBlurFilterStage(score_threshold=score),
+                )
+            )
+        elif name == "qrcode":
+            score = args.score if args.score is not None else 0.05
+            pipe.add_stage(
+                InterleavedAnnotationFilterStage(
+                    filter_stage=InterleavedQRCodeFilterStage(score_threshold=score),
+                )
+            )
+        elif name == "clip":
+            score = args.score if args.score is not None else 0.15
+            pipe.add_stage(
+                InterleavedAnnotationFilterStage(
+                    filter_stage=InterleavedCLIPScoreFilterStage(
+                        model_dir=CLIP_MODEL_DIR,
+                        min_score=score,
+                    ),
+                )
+            )
+        elif name == "ratio":
+            max_ratio = args.max_ratio if args.max_ratio is not None else float("inf")
+            pipe.add_stage(
+                InterleavedAnnotationFilterStage(
+                    filter_stage=InterleavedImageToTextRatioFilterStage(
+                        min_ratio=args.min_ratio,
+                        max_ratio=max_ratio,
+                    ),
+                )
+            )
+
 
 @dataclass
 class InterleavedAnnotationFilterStage(ProcessingStage[InterleavedBatch, InterleavedBatch]):
-    """Runs a single interleaved filter and attaches/updates annotation (sample_id, position)
-    for kept content rows in task metadata. Add multiple stages in the pipeline for multiple filters.
+    """Runs a single interleaved filter and updates annotation for all content rows.
+
+    Each row has ``sample_id``, ``position``, and cumulative ``keep_mask`` (AND across
+    filter stages so far). Task ``data`` is unchanged; only ``_metadata[annotation]`` is updated.
     Uses the same resources as the wrapped filter_stage.
     """
 
@@ -70,20 +116,35 @@ class InterleavedAnnotationFilterStage(ProcessingStage[InterleavedBatch, Interle
             return task
         keep_mask = self.filter_stage.keep_mask(task, df)
         content = (df["modality"] != "metadata") & (df["position"] >= 0)
-        passed = df.loc[keep_mask & content, ["sample_id", "position"]].drop_duplicates()
+        sub = df.loc[content]
+        base = sub[["sample_id", "position"]].copy()
+        base["keep_this"] = keep_mask.loc[sub.index].fillna(False).to_numpy(dtype=bool)
+
         current = task._metadata.get(ANNOTATION_METADATA_KEY)
         if current is not None and not current.empty:
-            annotation = passed.merge(current, on=["sample_id", "position"], how="inner")
+            prev = current[["sample_id", "position"]].copy()
+            if "keep_mask" in current.columns:
+                prev["keep_mask"] = current["keep_mask"].fillna(False).astype(bool)
+            else:
+                prev["keep_mask"] = True
+            merged = base.merge(prev, on=["sample_id", "position"], how="left")
+            merged["keep_mask"] = merged["keep_this"] & merged["keep_mask"].fillna(False)
         else:
-            annotation = passed
+            merged = base
+            merged["keep_mask"] = merged["keep_this"]
+
+        annotation = merged[["sample_id", "position", "keep_mask"]].drop_duplicates(
+            subset=["sample_id", "position"], keep="last"
+        )
         task._metadata[ANNOTATION_METADATA_KEY] = annotation if not annotation.empty else None
         return task
 
 
 @dataclass
 class InterleavedAnnotationParquetWriterStage(ProcessingStage[InterleavedBatch, InterleavedBatch]):
-    """Writes annotation (sample_id, position) from task metadata to parquet. Pass-through stage.
-    Expects annotation from InterleavedAnnotationFilterStage in task._metadata.
+    """Writes annotation ``sample_id``, ``position``, ``keep_mask`` from task metadata to parquet.
+
+    Pass-through stage. Expects annotation from ``InterleavedAnnotationFilterStage``.
     """
 
     path: str
@@ -131,7 +192,7 @@ def build_pipeline(args: argparse.Namespace) -> Pipeline:
 
     pipe = Pipeline(
         name="mint1t_annotation_multimodal",
-        description="WebDataset MINT1T -> annotation (sample_id, original position) for kept rows only",
+        description="WebDataset MINT1T -> annotation (sample_id, position, keep_mask) for all content rows",
     )
     pipe.add_stage(
         WebdatasetReader(
@@ -147,22 +208,8 @@ def build_pipeline(args: argparse.Namespace) -> Pipeline:
             per_text_fields=tuple(args.per_text_fields) if args.per_text_fields else (),
         )
     )
-    # Add one annotation filter stage per filter; annotation is intersected across stages
-    # pipe.add_stage(InterleavedAnnotationFilterStage(filter_stage=InterleavedBlurFilterStage()))
-    # pipe.add_stage(InterleavedAnnotationFilterStage(filter_stage=InterleavedQRCodeFilterStage()))
-    # pipe.add_stage(
-    #     InterleavedAnnotationFilterStage(
-    #         filter_stage=InterleavedCLIPScoreFilterStage(model_dir="./model", min_score=0.15)
-    #     )
-    # )
-    pipe.add_stage(
-        InterleavedAnnotationFilterStage(
-            filter_stage=InterleavedImageToTextRatioFilterStage(
-                min_ratio=0.001,
-                max_ratio=2,
-            )
-        )
-    )
+    # One annotation filter stage per --filters entry; annotation is intersected across stages
+    add_annotation_filters(pipe, args)
     pipe.add_stage(
         InterleavedAnnotationParquetWriterStage(
             path=args.output_path,
@@ -184,7 +231,7 @@ def main(args: argparse.Namespace) -> None:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="MINT1T multimodal pipeline: save only annotation (e.g. position id) of kept data"
+        description="MINT1T multimodal pipeline: save annotation (sample_id, position, keep_mask) for all content rows"
     )
     parser.add_argument("--input-path", type=str, required=True, help="Input tar shard path or directory")
     parser.add_argument("--output-path", type=str, required=True, help="Output directory for annotation parquet")
@@ -203,5 +250,35 @@ if __name__ == "__main__":
         type=str,
         default=None,
         help="JSON-encoded fsspec storage options for cloud paths",
+    )
+    parser.add_argument(
+        "--filters",
+        nargs="+",
+        choices=list(FILTER_CHOICES),
+        default=["qrcode"],
+        help="Interleaved filters to run (order matters). clip loads weights from ./model_weights.",
+    )
+    parser.add_argument(
+        "--score",
+        type=float,
+        default=None,
+        help=(
+            "Threshold for blur (min sharpness), qrcode (max QR area ratio), and clip (min similarity). "
+            "If omitted, each filter uses its stage default (blur 100, qrcode 0.05, clip 0.15)."
+        ),
+    )
+    parser.add_argument(
+        "--min-ratio",
+        type=float,
+        default=0.0,
+        dest="min_ratio",
+        help="Image-to-text ratio filter: min images-per-word for a sample",
+    )
+    parser.add_argument(
+        "--max-ratio",
+        type=float,
+        default=None,
+        dest="max_ratio",
+        help="Image-to-text ratio filter: max images-per-word (omit for no upper bound)",
     )
     main(parser.parse_args())

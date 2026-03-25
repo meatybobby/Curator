@@ -20,21 +20,34 @@ import html
 import http.server
 import io
 import json
+import os
 import socketserver
+import sys
 import urllib.parse
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
 
 import pandas as pd
 
+# Sibling module (no nemo_curator); allow running from repo root or this directory.
+_script_dir = Path(__file__).resolve().parent
+if str(_script_dir) not in sys.path:
+    sys.path.insert(0, str(_script_dir))
+
 try:
-    from PIL import Image
+    from PIL import Image  # noqa: E402
 except ImportError:
     Image = None
 
-from nemo_curator.stages.interleaved.io.readers.webdataset import WebdatasetReaderStage
-from nemo_curator.stages.interleaved.utils import materialize_task_binary_content
-from nemo_curator.stages.interleaved.utils.constants import DEFAULT_JSON_EXTENSIONS, DEFAULT_WEBDATASET_EXTENSIONS
-from nemo_curator.tasks import FileGroupTask, InterleavedBatch
-from nemo_curator.utils.file_utils import get_all_file_paths_under
+from preview_annotation_standalone import (  # noqa: E402
+    DEFAULT_JSON_EXTENSIONS,
+    DEFAULT_WEBDATASET_EXTENSIONS,
+    FileGroupTask,
+    InterleavedBatch,
+    WebdatasetReaderStage,
+    get_all_file_paths_under,
+    materialize_task_binary_content,
+)
 
 LIMIT_SAMPLES = 50
 MAX_TARS = 30
@@ -48,8 +61,21 @@ def _content_mask(df: pd.DataFrame) -> pd.Series:
     return (df["modality"] != "metadata") & (df["position"] >= 0)
 
 
-def _load_kept_set(annotation_path: str, storage_options: dict | None) -> set[tuple[str, int]]:
-    """Load annotation parquet files and return set of (sample_id, position) for kept rows."""
+def _read_one_annotation_parquet(path: str, storage_options: dict | None) -> pd.DataFrame | None:
+    try:
+        df = pd.read_parquet(path, storage_options=storage_options)
+    except Exception:
+        df = pd.read_parquet(path)
+    if "sample_id" not in df.columns or "position" not in df.columns:
+        return None
+    cols = ["sample_id", "position"]
+    if "keep_mask" in df.columns:
+        cols.append("keep_mask")
+    return df[cols]
+
+
+def _combine_annotation_parquets(annotation_path: str, storage_options: dict | None, num_workers: int) -> pd.DataFrame:
+    """Concatenate all annotation parquet files under ``annotation_path``."""
     paths = get_all_file_paths_under(
         annotation_path,
         recurse_subdirectories=True,
@@ -57,19 +83,101 @@ def _load_kept_set(annotation_path: str, storage_options: dict | None) -> set[tu
         storage_options=storage_options,
     )
     if not paths:
-        return set()
-    dfs = []
-    for p in paths:
-        try:
-            df = pd.read_parquet(p, storage_options=storage_options)
-        except Exception:
-            df = pd.read_parquet(p)
-        if "sample_id" in df.columns and "position" in df.columns:
-            dfs.append(df[["sample_id", "position"]])
+        return pd.DataFrame()
+    dfs: list[pd.DataFrame] = []
+    if num_workers <= 1:
+        for p in paths:
+            part = _read_one_annotation_parquet(p, storage_options)
+            if part is not None:
+                dfs.append(part)
+    else:
+        w = min(num_workers, len(paths))
+
+        def _read_annotation(p: str) -> pd.DataFrame | None:
+            return _read_one_annotation_parquet(p, storage_options)
+
+        with ThreadPoolExecutor(max_workers=w) as ex:
+            for part in ex.map(_read_annotation, paths):
+                if part is not None:
+                    dfs.append(part)
     if not dfs:
+        return pd.DataFrame()
+    return pd.concat(dfs, ignore_index=True)
+
+
+def _load_kept_set(annotation_path: str, storage_options: dict | None, num_workers: int) -> set[tuple[str, int]]:
+    """Load annotation parquet files and return set of (sample_id, position) for kept rows.
+
+    If ``keep_mask`` is present, only rows with True are kept. Legacy parquets without
+    ``keep_mask`` treat every row as kept.
+    """
+    combined = _combine_annotation_parquets(annotation_path, storage_options, num_workers)
+    if combined.empty:
         return set()
-    combined = pd.concat(dfs, ignore_index=True)
+    if "keep_mask" in combined.columns:
+        combined = combined.loc[combined["keep_mask"].fillna(False).astype(bool)]
     return set(zip(combined["sample_id"].astype(str), combined["position"].astype(int), strict=True))
+
+
+def _load_annotation_all_and_kept_sets(
+    annotation_path: str,
+    storage_options: dict | None,
+    num_workers: int,
+) -> tuple[set[tuple[str, int]], set[tuple[str, int]]]:
+    """Return (all content keys in parquet, kept keys) without reading WebDataset input.
+
+    Legacy parquets without ``keep_mask``: all keys are treated as kept only; all_keys == kept_keys.
+    """
+    combined = _combine_annotation_parquets(annotation_path, storage_options, num_workers)
+    if combined.empty:
+        return set(), set()
+    sid = combined["sample_id"].astype(str)
+    pos = combined["position"].astype(int)
+    all_keys = set(zip(sid, pos, strict=True))
+    if "keep_mask" in combined.columns:
+        km = combined["keep_mask"].fillna(False).astype(bool)
+        kept = set(zip(sid[km], pos[km], strict=True))
+    else:
+        kept = all_keys
+    return all_keys, kept
+
+
+def _read_one_tar_kept_filtered(
+    index: int,
+    tar_path: str,
+    read_kwargs: dict,
+    kept_set: set[tuple[str, int]],
+) -> tuple[int, pd.DataFrame, pd.DataFrame]:
+    """Parse one tar into kept / filtered content rows (thread-local reader)."""
+    reader = WebdatasetReaderStage(
+        source_id_field="pdf_name",
+        read_kwargs=read_kwargs,
+        materialize_on_read=False,
+        max_batch_bytes=None,
+        json_extensions=tuple(DEFAULT_JSON_EXTENSIONS),
+    )
+    task = FileGroupTask(
+        task_id=f"preview_{index}",
+        dataset_name="preview",
+        data=[tar_path],
+        _metadata={"source_files": [tar_path]},
+    )
+    out = reader.process(task)
+    batches = out if isinstance(out, list) else [out]
+    kept_parts: list[pd.DataFrame] = []
+    filtered_parts: list[pd.DataFrame] = []
+    for batch in batches:
+        df = batch.to_pandas()
+        if df.empty:
+            continue
+        content = _content_mask(df)
+        row_keys = list(zip(df["sample_id"].astype(str), df["position"].astype(int), strict=True))
+        in_kept = pd.Series([k in kept_set for k in row_keys], index=df.index)
+        kept_parts.append(df[content & in_kept])
+        filtered_parts.append(df[content & ~in_kept])
+    k = pd.concat(kept_parts, ignore_index=True) if kept_parts else pd.DataFrame()
+    f = pd.concat(filtered_parts, ignore_index=True) if filtered_parts else pd.DataFrame()
+    return index, k, f
 
 
 def _collect_kept_and_filtered(
@@ -78,9 +186,10 @@ def _collect_kept_and_filtered(
     read_kwargs: dict | None,
     max_tars: int,
     limit_samples: int,
+    num_workers: int,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     read_kwargs = read_kwargs or {}
-    kept_set = _load_kept_set(annotation_path, read_kwargs.get("storage_options"))
+    kept_set = _load_kept_set(annotation_path, read_kwargs.get("storage_options"), num_workers)
 
     if isinstance(input_path, str):
         paths = get_all_file_paths_under(
@@ -95,52 +204,72 @@ def _collect_kept_and_filtered(
     if not paths:
         return pd.DataFrame(), pd.DataFrame()
 
-    reader = WebdatasetReaderStage(
-        source_id_field="pdf_name",
-        read_kwargs=read_kwargs,
-        materialize_on_read=False,
-        max_batch_bytes=None,
-        json_extensions=tuple(DEFAULT_JSON_EXTENSIONS),
-    )
-
     kept_chunks: list[pd.DataFrame] = []
     filtered_chunks: list[pd.DataFrame] = []
 
-    for i, tar_path in enumerate(paths):
-        task = FileGroupTask(
-            task_id=f"preview_{i}",
-            dataset_name="preview",
-            data=[tar_path],
-            _metadata={"source_files": [tar_path]},
+    if num_workers <= 1:
+        reader = WebdatasetReaderStage(
+            source_id_field="pdf_name",
+            read_kwargs=read_kwargs,
+            materialize_on_read=False,
+            max_batch_bytes=None,
+            json_extensions=tuple(DEFAULT_JSON_EXTENSIONS),
         )
-        out = reader.process(task)
-        batches = out if isinstance(out, list) else [out]
-        for batch in batches:
-            df = batch.to_pandas()
-            if df.empty:
-                continue
-            content = _content_mask(df)
-            row_keys = list(zip(df["sample_id"].astype(str), df["position"].astype(int), strict=True))
-            in_kept = pd.Series([k in kept_set for k in row_keys], index=df.index)
-            kept_content = df[content & in_kept]
-            filtered_content = df[content & ~in_kept]
-            kept_chunks.append(kept_content)
-            filtered_chunks.append(filtered_content)
 
-        kept_df_so_far = pd.concat(kept_chunks, ignore_index=True) if kept_chunks else pd.DataFrame()
-        filtered_df_so_far = pd.concat(filtered_chunks, ignore_index=True) if filtered_chunks else pd.DataFrame()
-        if kept_df_so_far.empty and filtered_df_so_far.empty:
-            continue
-        all_sids = sorted(
-            pd.unique(
-                list(kept_df_so_far["sample_id"].dropna().astype(str))
-                + list(filtered_df_so_far["sample_id"].dropna().astype(str))
-            ).tolist()
-        )
-        all_kept_sids = [s for s in all_sids if len(filtered_df_so_far[filtered_df_so_far["sample_id"].astype(str) == s]) == 0]
-        has_filtered_sids = [s for s in all_sids if len(filtered_df_so_far[filtered_df_so_far["sample_id"].astype(str) == s]) > 0]
-        if len(all_kept_sids) >= limit_samples and len(has_filtered_sids) >= limit_samples:
-            break
+        for i, tar_path in enumerate(paths):
+            task = FileGroupTask(
+                task_id=f"preview_{i}",
+                dataset_name="preview",
+                data=[tar_path],
+                _metadata={"source_files": [tar_path]},
+            )
+            out = reader.process(task)
+            batches = out if isinstance(out, list) else [out]
+            for batch in batches:
+                df = batch.to_pandas()
+                if df.empty:
+                    continue
+                content = _content_mask(df)
+                row_keys = list(zip(df["sample_id"].astype(str), df["position"].astype(int), strict=True))
+                in_kept = pd.Series([k in kept_set for k in row_keys], index=df.index)
+                kept_content = df[content & in_kept]
+                filtered_content = df[content & ~in_kept]
+                kept_chunks.append(kept_content)
+                filtered_chunks.append(filtered_content)
+
+            kept_df_so_far = pd.concat(kept_chunks, ignore_index=True) if kept_chunks else pd.DataFrame()
+            filtered_df_so_far = pd.concat(filtered_chunks, ignore_index=True) if filtered_chunks else pd.DataFrame()
+            if kept_df_so_far.empty and filtered_df_so_far.empty:
+                continue
+            all_sids = sorted(
+                pd.unique(
+                    list(kept_df_so_far["sample_id"].dropna().astype(str))
+                    + list(filtered_df_so_far["sample_id"].dropna().astype(str))
+                ).tolist()
+            )
+            all_kept_sids = [
+                s for s in all_sids if len(filtered_df_so_far[filtered_df_so_far["sample_id"].astype(str) == s]) == 0
+            ]
+            has_filtered_sids = [
+                s for s in all_sids if len(filtered_df_so_far[filtered_df_so_far["sample_id"].astype(str) == s]) > 0
+            ]
+            if len(all_kept_sids) >= limit_samples and len(has_filtered_sids) >= limit_samples:
+                break
+    else:
+        workers = min(num_workers, len(paths))
+        per_index: dict[int, tuple[pd.DataFrame, pd.DataFrame]] = {}
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            futures = {
+                ex.submit(_read_one_tar_kept_filtered, i, tar_path, read_kwargs, kept_set): i
+                for i, tar_path in enumerate(paths)
+            }
+            for fut in as_completed(futures):
+                idx, k, f = fut.result()
+                per_index[idx] = (k, f)
+        for i in range(len(paths)):
+            k, f = per_index.get(i, (pd.DataFrame(), pd.DataFrame()))
+            kept_chunks.append(k)
+            filtered_chunks.append(f)
 
     kept_df = pd.concat(kept_chunks, ignore_index=True) if kept_chunks else pd.DataFrame()
     filtered_df = pd.concat(filtered_chunks, ignore_index=True) if filtered_chunks else pd.DataFrame()
@@ -169,6 +298,34 @@ def _materialize_rows(df: pd.DataFrame, io_kwargs: dict | None) -> pd.DataFrame:
     )
     out = materialize_task_binary_content(task, only_missing_binary=True, io_kwargs=io_kwargs)
     return out.to_pandas()
+
+
+def _split_dataframe(df: pd.DataFrame, n: int) -> list[pd.DataFrame]:
+    if n <= 1 or len(df) <= 1:
+        return [df]
+    n = min(n, len(df))
+    base, rem = divmod(len(df), n)
+    parts: list[pd.DataFrame] = []
+    start = 0
+    for i in range(n):
+        sz = base + (1 if i < rem else 0)
+        if sz:
+            parts.append(df.iloc[start : start + sz].copy())
+            start += sz
+    return parts if parts else [df]
+
+
+def _materialize_rows_parallel(df: pd.DataFrame, io_kwargs: dict | None, num_workers: int) -> pd.DataFrame:
+    if df.empty or num_workers <= 1:
+        return _materialize_rows(df, io_kwargs)
+    parts = _split_dataframe(df, num_workers)
+    if len(parts) <= 1:
+        return _materialize_rows(df, io_kwargs)
+    workers = min(num_workers, len(parts))
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        futures = [ex.submit(_materialize_rows, p, io_kwargs) for p in parts]
+        merged = [f.result() for f in futures]
+    return pd.concat(merged, ignore_index=True)
 
 
 def _safe_str(val: object) -> str:
@@ -377,25 +534,37 @@ def main() -> None:
     )
     parser.add_argument("--max-samples", type=int, default=LIMIT_SAMPLES, help="Max samples per list: all-kept and with-filtered (default: 50)")
     parser.add_argument("--max-tars", type=int, default=MAX_TARS, help="Max tar files to scan")
+    default_workers = 16
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=default_workers,
+        help=(
+            "Thread pool for annotation parquet read, tar read, materialize shards, and detail HTML "
+            f"(default: {default_workers}; use 1 for sequential tar scan with early stop)"
+        ),
+    )
     args = parser.parse_args()
 
     read_kwargs = {}
     if args.storage_options_json:
         read_kwargs["storage_options"] = json.loads(args.storage_options_json)
 
+    workers = max(1, args.workers)
     kept_df, filtered_df = _collect_kept_and_filtered(
         args.input_path,
         args.annotation_path,
         read_kwargs,
         max_tars=args.max_tars,
         limit_samples=args.max_samples,
+        num_workers=workers,
     )
     if kept_df.empty and filtered_df.empty:
         print("No content rows found. Check --input-path and that tars contain WebDataset samples.")
         return
 
-    kept_df = _materialize_rows(kept_df, read_kwargs)
-    filtered_df = _materialize_rows(filtered_df, read_kwargs)
+    kept_df = _materialize_rows_parallel(kept_df, read_kwargs, workers)
+    filtered_df = _materialize_rows_parallel(filtered_df, read_kwargs, workers)
 
     main_html = _build_main_html(kept_df, filtered_df)
     sample_ids = sorted(
@@ -404,11 +573,30 @@ def main() -> None:
             + list(filtered_df["sample_id"].dropna().astype(str))
         ).tolist()
     )
-    detail_html_by_id = {}
-    for sid in sample_ids:
-        k = kept_df[kept_df["sample_id"].astype(str) == sid]
-        f = filtered_df[filtered_df["sample_id"].astype(str) == sid]
-        detail_html_by_id[sid] = _build_detail_html(sid, k, f)
+    detail_html_by_id: dict[str, str] = {}
+    if workers <= 1:
+        for sid in sample_ids:
+            k = kept_df[kept_df["sample_id"].astype(str) == sid]
+            f = filtered_df[filtered_df["sample_id"].astype(str) == sid]
+            detail_html_by_id[sid] = _build_detail_html(sid, k, f)
+    else:
+        w = min(workers, max(1, len(sample_ids)))
+        work: list[tuple[str, pd.DataFrame, pd.DataFrame]] = [
+            (
+                sid,
+                kept_df[kept_df["sample_id"].astype(str) == sid].copy(),
+                filtered_df[filtered_df["sample_id"].astype(str) == sid].copy(),
+            )
+            for sid in sample_ids
+        ]
+
+        def _detail_from_triple(triple: tuple[str, pd.DataFrame, pd.DataFrame]) -> tuple[str, str]:
+            sid, k, f = triple
+            return sid, _build_detail_html(sid, k, f)
+
+        with ThreadPoolExecutor(max_workers=w) as ex:
+            for sid, page in ex.map(_detail_from_triple, work):
+                detail_html_by_id[sid] = page
 
     def handler_factory(main: str, details: dict[str, str]):
         class Handler(http.server.BaseHTTPRequestHandler):
@@ -442,8 +630,11 @@ def main() -> None:
 
     Handler = handler_factory(main_html, detail_html_by_id)
 
-    with socketserver.TCPServer(("", args.port), Handler) as httpd:
-        print(f"Open http://localhost:{args.port} for preview.")
+    class ThreadingHTTPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
+        daemon_threads = True
+
+    with ThreadingHTTPServer(("", args.port), Handler) as httpd:
+        print(f"Open http://localhost:{args.port} for preview ({workers} load worker thread(s)).")
         try:
             httpd.serve_forever()
         finally:
