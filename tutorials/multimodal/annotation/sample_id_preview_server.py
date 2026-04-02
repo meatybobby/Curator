@@ -40,7 +40,7 @@ if str(_script_dir) not in sys.path:
     sys.path.insert(0, str(_script_dir))
 
 try:
-    from PIL import Image  # noqa: E402
+    from PIL import Image
 except ImportError:
     Image = None
 
@@ -230,9 +230,7 @@ def _row_to_html(row: pd.Series, index: int) -> str:
     text_val = row.get("text_content")
     text = html.escape(_safe_str(text_val))
 
-    parts = [
-        f"<div class='row'><span class='meta'>#{index} sample_id={sid} position={pos} modality={mod}</span>"
-    ]
+    parts = [f"<div class='row'><span class='meta'>#{index} sample_id={sid} position={pos} modality={mod}</span>"]
     if _safe_str(row.get("modality")) == "image":
         raw = row.get("binary_content")
         b = _to_bytes(raw)

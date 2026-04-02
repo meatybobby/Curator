@@ -23,7 +23,7 @@ import argparse
 import json
 import uuid
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Literal
+from typing import Any, Literal
 
 from fsspec.core import url_to_fs
 
@@ -31,17 +31,17 @@ import nemo_curator.stages.text.io.writer.utils as writer_utils
 from nemo_curator.core.client import RayClient
 from nemo_curator.pipeline import Pipeline
 from nemo_curator.stages.base import ProcessingStage
-from nemo_curator.stages.interleaved.io import WebdatasetReader
-from nemo_curator.stages.interleaved.stages import BaseInterleavedFilterStage
-from nemo_curator.tasks import InterleavedBatch
-from nemo_curator.utils.client_utils import is_remote_url
-from nemo_curator.utils.file_utils import check_output_mode
 from nemo_curator.stages.interleaved.filter import (
     InterleavedBlurFilterStage,
     InterleavedCLIPScoreFilterStage,
     InterleavedImageToTextRatioFilterStage,
     InterleavedQRCodeFilterStage,
 )
+from nemo_curator.stages.interleaved.io import WebdatasetReader
+from nemo_curator.stages.interleaved.stages import BaseInterleavedFilterStage
+from nemo_curator.tasks import InterleavedBatch
+from nemo_curator.utils.client_utils import is_remote_url
+from nemo_curator.utils.file_utils import check_output_mode
 
 ANNOTATION_METADATA_KEY = "annotation"
 

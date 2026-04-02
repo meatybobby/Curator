@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Self-contained WebDataset read + binary materialization for preview_annotation_server (no nemo_curator)."""
+"""Self-contained WebDataset + OmniCorpus read and binary materialization (no nemo_curator)."""
 
 from __future__ import annotations
 
@@ -20,8 +20,11 @@ import io
 import json
 import logging
 import mimetypes
+import pickle
 import posixpath
 import tarfile
+from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, NamedTuple
@@ -40,8 +43,11 @@ __all__ = [
     "DEFAULT_WEBDATASET_EXTENSIONS",
     "FileGroupTask",
     "InterleavedBatch",
+    "OmniCorpusReaderStage",
     "WebdatasetReaderStage",
+    "collect_omnicorpus_kept_filtered_chunks",
     "get_all_file_paths_under",
+    "materialize_omnicorpus_binary_content",
     "materialize_task_binary_content",
 ]
 
@@ -741,6 +747,243 @@ class WebdatasetReaderStage:
         return batches if len(batches) > 1 else batches[0]
 
 
+# -- OmniCorpus-CC reader (mirrors omni_corpus_annotation.stages.omnicorpus_reader; no external curator deps) --
+
+_METADATA_JSON_EXT = ".metadata.json"
+_OMNI_CONTENT_EXT = ".json_image_text"
+_OMNI_IMAGES_EXT = ".images"
+_OMNI_GENERAL_METADATA_EXT = ".general_metadata.pkl"
+
+_OMNI_GENERAL_METADATA_FIELDS = (
+    "url",
+    "fluency_prob",
+    "non_advertisement_prob",
+    "politics_prob",
+    "porn_prob",
+    "toxic_prob",
+)
+
+
+@dataclass
+class OmniCorpusReaderStage:
+    """Read OmniCorpus-CC shards into row-wise tables (images as ``source_ref`` to ``.images`` pickle)."""
+
+    name: str = "omnicorpus_reader"
+    max_batch_bytes: int | None = None
+    include_general_metadata: bool = True
+    general_metadata_fields: tuple[str, ...] = _OMNI_GENERAL_METADATA_FIELDS
+    read_kwargs: dict[str, Any] = field(default_factory=dict)
+
+    def _build_source_ref(
+        self,
+        tar_path: str,
+        member_name: str | None,
+        member_info: dict[str, tarfile.TarInfo] | None = None,
+    ) -> str:
+        byte_offset = None
+        byte_size = None
+        if member_info and member_name and member_name in member_info:
+            info = member_info[member_name]
+            byte_offset = info.offset_data
+            byte_size = info.size
+        return InterleavedBatch.build_source_ref(
+            path=tar_path,
+            member=member_name,
+            byte_offset=byte_offset,
+            byte_size=byte_size,
+        )
+
+    def _metadata_row(
+        self,
+        doc_id: str,
+        tar_path: str,
+        metadata_member: str,
+        member_info: dict[str, tarfile.TarInfo],
+        general_meta: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        row: dict[str, Any] = {
+            "sample_id": doc_id,
+            "position": -1,
+            "modality": "metadata",
+            "content_type": "application/json",
+            "text_content": None,
+            "binary_content": None,
+            "source_ref": self._build_source_ref(tar_path, metadata_member, member_info),
+            "materialize_error": None,
+            "image_id": None,
+        }
+        if self.include_general_metadata and general_meta:
+            for field_name in self.general_metadata_fields:
+                val = general_meta.get(field_name)
+                if hasattr(val, "tolist"):
+                    val = val.tolist()
+                row[field_name] = val
+        return row
+
+    def _text_row(
+        self,
+        doc_id: str,
+        position: int,
+        text: str,
+        tar_path: str,
+        content_member: str,
+        member_info: dict[str, tarfile.TarInfo],
+    ) -> dict[str, Any]:
+        return {
+            "sample_id": doc_id,
+            "position": position,
+            "modality": "text",
+            "content_type": "text/plain",
+            "text_content": text,
+            "binary_content": None,
+            "source_ref": self._build_source_ref(tar_path, content_member, member_info),
+            "materialize_error": None,
+            "image_id": None,
+        }
+
+    def _image_row(
+        self,
+        doc_id: str,
+        position: int,
+        image_id: str,
+        tar_path: str,
+        images_member: str,
+        member_info: dict[str, tarfile.TarInfo],
+    ) -> dict[str, Any]:
+        return {
+            "sample_id": doc_id,
+            "position": position,
+            "modality": "image",
+            "content_type": "image/jpeg",
+            "text_content": None,
+            "binary_content": None,
+            "source_ref": self._build_source_ref(tar_path, images_member, member_info),
+            "materialize_error": None,
+            "image_id": image_id,
+        }
+
+    def _rows_from_sample(
+        self,
+        doc_id: str,
+        tar_path: str,
+        content_list: list[dict[str, Any]],
+        member_info: dict[str, tarfile.TarInfo],
+        general_meta: dict[str, Any] | None,
+    ) -> list[dict[str, Any]]:
+        metadata_member = f"{doc_id}{_METADATA_JSON_EXT}"
+        content_member = f"{doc_id}{_OMNI_CONTENT_EXT}"
+        images_member = f"{doc_id}{_OMNI_IMAGES_EXT}"
+
+        rows: list[dict[str, Any]] = []
+        rows.append(self._metadata_row(doc_id, tar_path, metadata_member, member_info, general_meta))
+
+        for position, item in enumerate(content_list):
+            item_type = item.get("type")
+            if item_type == "text":
+                text_val = item.get("text", "")
+                if text_val:
+                    rows.append(self._text_row(doc_id, position, text_val, tar_path, content_member, member_info))
+            elif item_type == "image":
+                image_id = item.get("image", "")
+                rows.append(self._image_row(doc_id, position, image_id, tar_path, images_member, member_info))
+
+        if self.include_general_metadata and general_meta:
+            for field_name in self.general_metadata_fields:
+                for row in rows:
+                    row.setdefault(field_name, None)
+
+        return rows
+
+    def _empty_output_schema(self) -> pa.Schema:
+        extra_fields = [pa.field("image_id", pa.string(), nullable=True)]
+        if self.include_general_metadata:
+            for field_name in self.general_metadata_fields:
+                extra_fields.append(pa.field(field_name, pa.null(), nullable=True))
+        return pa.schema([*INTERLEAVED_SCHEMA, *extra_fields])
+
+    @staticmethod
+    def _reconcile_schema(inferred: pa.Schema) -> pa.Schema:
+        canonical = {f.name: f for f in INTERLEAVED_SCHEMA}
+        fields = []
+        for f in inferred:
+            if f.name in canonical:
+                fields.append(canonical[f.name])
+            else:
+                fields.append(f)
+        return pa.schema(fields)
+
+    def process(self, task: FileGroupTask) -> InterleavedBatch | list[InterleavedBatch]:
+        rows: list[dict[str, Any]] = []
+        storage_options = resolve_storage_options(io_kwargs=self.read_kwargs)
+
+        for tar_path in task.data:
+            try:
+                with (
+                    fsspec.open(tar_path, mode="rb", **storage_options) as fobj,
+                    tarfile.open(fileobj=fobj, mode="r:*") as tf,
+                ):
+                    members = [m for m in tf.getmembers() if m.isfile()]
+                    member_names = {m.name for m in members}
+                    member_info = {m.name: m for m in members}
+
+                    doc_ids = sorted(
+                        {m.name[: -len(_METADATA_JSON_EXT)] for m in members if m.name.endswith(_METADATA_JSON_EXT)}
+                    )
+
+                    for doc_id in doc_ids:
+                        content_name = f"{doc_id}{_OMNI_CONTENT_EXT}"
+                        if content_name not in member_names:
+                            logger.warning("Missing %s in %s", content_name, tar_path)
+                            continue
+
+                        content_data = json.load(tf.extractfile(content_name))
+                        if not isinstance(content_data, list):
+                            logger.warning(
+                                "Expected list in %s, got %s",
+                                content_name,
+                                type(content_data).__name__,
+                            )
+                            continue
+
+                        general_meta = None
+                        general_meta_name = f"{doc_id}{_OMNI_GENERAL_METADATA_EXT}"
+                        if self.include_general_metadata and general_meta_name in member_names:
+                            try:
+                                general_meta = pickle.load(tf.extractfile(general_meta_name))
+                            except Exception:
+                                logger.warning("Failed to load %s", general_meta_name)
+
+                        rows.extend(self._rows_from_sample(doc_id, tar_path, content_data, member_info, general_meta))
+            except (OSError, tarfile.TarError) as exc:
+                logger.error("Failed to read tar %s: %s", tar_path, exc)
+
+        if rows:
+            table = pa.Table.from_pylist(rows)
+            table = table.cast(self._reconcile_schema(table.schema))
+        else:
+            table = pa.Table.from_pylist([], schema=self._empty_output_schema())
+
+        splits = split_table_by_group_max_bytes(table, "sample_id", self.max_batch_bytes)
+        metadata = dict(task._metadata)
+        metadata["source_files"] = list(task.data)
+        if storage_options:
+            metadata["source_storage_options"] = storage_options
+
+        batches: list[InterleavedBatch] = []
+        for idx, split in enumerate(splits):
+            task_id = f"{task.task_id}_processed" if len(splits) == 1 else f"{task.task_id}_processed_{idx:05d}"
+            batches.append(
+                InterleavedBatch(
+                    task_id=task_id,
+                    dataset_name=task.dataset_name,
+                    data=split,
+                    _metadata=metadata,
+                    _stage_perf=task._stage_perf,
+                )
+            )
+        return batches if len(batches) > 1 else batches[0]
+
+
 # -- binary materialization (mirrors nemo_curator.stages.interleaved.utils.materialization) --
 
 
@@ -967,6 +1210,159 @@ def _task_with_dataframe(task: InterleavedBatch, df: pd.DataFrame) -> Interleave
     )
 
 
+def _tar_extract_omnicorpus_pickle(
+    tar_path: str,
+    member_name: str,
+    storage_options: dict[str, object],
+) -> dict[str, bytes] | None:
+    try:
+        with (
+            fsspec.open(tar_path, mode="rb", **storage_options) as fobj,
+            tarfile.open(fileobj=fobj, mode="r:*") as tf,
+        ):
+            extracted = tf.extractfile(member_name)
+            if extracted is None:
+                return None
+            return pickle.load(extracted)
+    except Exception:
+        return None
+
+
+def materialize_omnicorpus_binary_content(
+    task: InterleavedBatch,
+    *,
+    io_kwargs: dict[str, object] | None = None,
+) -> InterleavedBatch:
+    """Fill ``binary_content`` for OmniCorpus image rows from ``.images`` pickle members."""
+    df = task.to_pandas().copy()
+    if df.empty:
+        return task
+
+    image_mask = (df["modality"] == "image") & df["binary_content"].isna()
+    if not image_mask.any():
+        return task
+
+    storage_options = resolve_storage_options(task=task, io_kwargs=io_kwargs)
+
+    parsed_series = df.loc[image_mask, "source_ref"].apply(InterleavedBatch.parse_source_ref)
+    parsed_df = pd.DataFrame(parsed_series.tolist(), index=parsed_series.index)
+
+    range_groups: dict[tuple[str, int, int], list[tuple[int, str, str]]] = defaultdict(list)
+    tar_extract_groups: dict[tuple[str, str], list[tuple[int, str]]] = defaultdict(list)
+
+    fs = None
+    fs_path_cache: dict[str, str] = {}
+
+    for idx in parsed_df.index:
+        path = parsed_df.loc[idx, "path"]
+        member = parsed_df.loc[idx, "member"]
+        if not path or not member:
+            df.at[idx, "materialize_error"] = "missing path or member in source_ref"
+            continue
+
+        image_id = (
+            str(df.loc[idx, "image_id"]) if "image_id" in df.columns and pd.notna(df.loc[idx, "image_id"]) else ""
+        )
+        offset = parsed_df.loc[idx, "byte_offset"]
+        size = parsed_df.loc[idx, "byte_size"]
+        path_str = str(path)
+        member_str = str(member)
+
+        if offset is not None and size is not None and int(size) > 0:
+            if fs is None:
+                try:
+                    fs, _ = url_to_fs(path_str, **storage_options)
+                except (ValueError, OSError):
+                    fs = None
+
+            if fs is not None:
+                if path_str not in fs_path_cache:
+                    _, fs_path_cache[path_str] = url_to_fs(path_str, **storage_options)
+                range_key = (fs_path_cache[path_str], int(offset), int(size))
+                range_groups[range_key].append((idx, member_str, image_id))
+                continue
+
+        tar_extract_groups[(path_str, member_str)].append((idx, image_id))
+
+    materialized = 0
+    errors = 0
+
+    if fs is not None and range_groups:
+        range_keys = list(range_groups.keys())
+        cat_paths = [fp for fp, _, _ in range_keys]
+        cat_starts = [off for _, off, _ in range_keys]
+        cat_ends = [off + sz for _, off, sz in range_keys]
+
+        try:
+            blobs = fs.cat_ranges(cat_paths, cat_starts, cat_ends)
+        except (OSError, RuntimeError, ValueError) as exc:
+            logger.warning("cat_ranges failed (%d ranges): %s", len(range_keys), exc)
+            blobs = [exc] * len(range_keys)
+
+        for key, blob in zip(range_keys, blobs, strict=True):
+            rows = range_groups[key]
+
+            if isinstance(blob, Exception) or blob is None or len(blob) == 0:
+                for idx, member_str, image_id in rows:
+                    tar_path_orig = next((p for p, fp in fs_path_cache.items() if fp == key[0]), key[0])
+                    tar_extract_groups[(tar_path_orig, member_str)].append((idx, image_id))
+                continue
+
+            try:
+                raw = bytes(blob) if not isinstance(blob, bytes) else blob
+                images_dict = pickle.loads(raw)
+            except Exception:
+                for idx, member_str, image_id in rows:
+                    df.at[idx, "materialize_error"] = "pickle decode failed"
+                    errors += 1
+                continue
+
+            if not isinstance(images_dict, dict):
+                for idx, member_str, image_id in rows:
+                    df.at[idx, "materialize_error"] = "pickle did not decode to dict"
+                    errors += 1
+                continue
+
+            for idx, _member_str, image_id in rows:
+                image_bytes = images_dict.get(image_id)
+                if image_bytes is not None:
+                    df.at[idx, "binary_content"] = image_bytes
+                    df.at[idx, "materialize_error"] = None
+                    materialized += 1
+                else:
+                    df.at[idx, "materialize_error"] = f"image_id '{image_id}' not found in pickle"
+                    errors += 1
+
+    if tar_extract_groups:
+        logger.info("Falling back to tar-extract for %d pickle members", len(tar_extract_groups))
+        for (tar_path, member_name), row_entries in tar_extract_groups.items():
+            images_dict = _tar_extract_omnicorpus_pickle(tar_path, member_name, storage_options)
+            if images_dict is None or not isinstance(images_dict, dict):
+                for idx, image_id in row_entries:
+                    df.at[idx, "materialize_error"] = f"failed to load pickle from '{member_name}'"
+                    errors += 1
+                continue
+
+            for idx, image_id in row_entries:
+                image_bytes = images_dict.get(image_id)
+                if image_bytes is not None:
+                    df.at[idx, "binary_content"] = image_bytes
+                    df.at[idx, "materialize_error"] = None
+                    materialized += 1
+                else:
+                    df.at[idx, "materialize_error"] = f"image_id '{image_id}' not found in pickle"
+                    errors += 1
+
+    logger.info(
+        "OmniCorpus materialization: %d/%d images materialized, %d errors",
+        materialized,
+        int(image_mask.sum()),
+        errors,
+    )
+
+    return _task_with_dataframe(task, df)
+
+
 def materialize_task_binary_content(
     task: InterleavedBatch,
     *,
@@ -1001,3 +1397,130 @@ def materialize_task_binary_content(
     out["binary_content"] = pd.Series(binary_values, dtype="object")
     out["materialize_error"] = pd.Series(error_values, dtype="object")
     return _task_with_dataframe(task, out)
+
+
+def _omnicorpus_content_mask(df: pd.DataFrame) -> pd.Series:
+    return (df["modality"] != "metadata") & (df["position"] >= 0)
+
+
+def _read_one_tar_omnicorpus_kept_filtered(
+    index: int,
+    tar_path: str,
+    read_kwargs: dict[str, Any],
+    kept_set: set[tuple[str, int]],
+    include_general_metadata: bool,
+    max_batch_bytes: int | None,
+) -> tuple[int, pd.DataFrame, pd.DataFrame]:
+    reader = OmniCorpusReaderStage(
+        max_batch_bytes=max_batch_bytes,
+        read_kwargs=read_kwargs,
+        include_general_metadata=include_general_metadata,
+    )
+    task = FileGroupTask(
+        task_id=f"preview_{index}",
+        dataset_name="preview",
+        data=[tar_path],
+        _metadata={"source_files": [tar_path]},
+    )
+    out = reader.process(task)
+    batches = out if isinstance(out, list) else [out]
+    kept_parts: list[pd.DataFrame] = []
+    filtered_parts: list[pd.DataFrame] = []
+    for batch in batches:
+        mat = materialize_omnicorpus_binary_content(batch, io_kwargs=read_kwargs)
+        df = mat.to_pandas()
+        if df.empty:
+            continue
+        content = _omnicorpus_content_mask(df)
+        row_keys = list(zip(df["sample_id"].astype(str), df["position"].astype(int), strict=True))
+        in_kept = pd.Series([k in kept_set for k in row_keys], index=df.index)
+        kept_parts.append(df[content & in_kept])
+        filtered_parts.append(df[content & ~in_kept])
+    k = pd.concat(kept_parts, ignore_index=True) if kept_parts else pd.DataFrame()
+    f = pd.concat(filtered_parts, ignore_index=True) if filtered_parts else pd.DataFrame()
+    return index, k, f
+
+
+def collect_omnicorpus_kept_filtered_chunks(
+    paths: list[str],
+    read_kwargs: dict[str, Any],
+    kept_set: set[tuple[str, int]],
+    limit_samples: int,
+    num_workers: int,
+    include_general_metadata: bool,
+    omni_max_batch_bytes: int | None,
+) -> tuple[list[pd.DataFrame], list[pd.DataFrame]]:
+    """Scan OmniCorpus tars and return lists of kept / filtered content row frames (for preview server)."""
+    kept_chunks: list[pd.DataFrame] = []
+    filtered_chunks: list[pd.DataFrame] = []
+
+    if num_workers <= 1:
+        reader = OmniCorpusReaderStage(
+            max_batch_bytes=omni_max_batch_bytes,
+            read_kwargs=read_kwargs,
+            include_general_metadata=include_general_metadata,
+        )
+
+        for i, tar_path in enumerate(paths):
+            task = FileGroupTask(
+                task_id=f"preview_{i}",
+                dataset_name="preview",
+                data=[tar_path],
+                _metadata={"source_files": [tar_path]},
+            )
+            out = reader.process(task)
+            batches = out if isinstance(out, list) else [out]
+            for batch in batches:
+                mat = materialize_omnicorpus_binary_content(batch, io_kwargs=read_kwargs)
+                df = mat.to_pandas()
+                if df.empty:
+                    continue
+                content = _omnicorpus_content_mask(df)
+                row_keys = list(zip(df["sample_id"].astype(str), df["position"].astype(int), strict=True))
+                in_kept = pd.Series([k in kept_set for k in row_keys], index=df.index)
+                kept_chunks.append(df[content & in_kept])
+                filtered_chunks.append(df[content & ~in_kept])
+
+            kept_df_so_far = pd.concat(kept_chunks, ignore_index=True) if kept_chunks else pd.DataFrame()
+            filtered_df_so_far = pd.concat(filtered_chunks, ignore_index=True) if filtered_chunks else pd.DataFrame()
+            if kept_df_so_far.empty and filtered_df_so_far.empty:
+                continue
+            all_sids = sorted(
+                pd.unique(
+                    list(kept_df_so_far["sample_id"].dropna().astype(str))
+                    + list(filtered_df_so_far["sample_id"].dropna().astype(str))
+                ).tolist()
+            )
+            all_kept_sids = [
+                s for s in all_sids if len(filtered_df_so_far[filtered_df_so_far["sample_id"].astype(str) == s]) == 0
+            ]
+            has_filtered_sids = [
+                s for s in all_sids if len(filtered_df_so_far[filtered_df_so_far["sample_id"].astype(str) == s]) > 0
+            ]
+            if len(all_kept_sids) >= limit_samples and len(has_filtered_sids) >= limit_samples:
+                break
+    else:
+        workers = min(num_workers, len(paths))
+        per_index: dict[int, tuple[pd.DataFrame, pd.DataFrame]] = {}
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            futures = {
+                ex.submit(
+                    _read_one_tar_omnicorpus_kept_filtered,
+                    i,
+                    tar_path,
+                    read_kwargs,
+                    kept_set,
+                    include_general_metadata,
+                    omni_max_batch_bytes,
+                ): i
+                for i, tar_path in enumerate(paths)
+            }
+            for fut in as_completed(futures):
+                idx, k, f = fut.result()
+                per_index[idx] = (k, f)
+        for i in range(len(paths)):
+            k, f = per_index.get(i, (pd.DataFrame(), pd.DataFrame()))
+            kept_chunks.append(k)
+            filtered_chunks.append(f)
+
+    return kept_chunks, filtered_chunks

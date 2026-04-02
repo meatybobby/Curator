@@ -12,7 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Serve a web page showing kept vs filtered rows by sample_id using annotation parquet and original data."""
+"""Serve a web page showing kept vs filtered rows by sample_id using annotation parquet and original data.
+
+Supports:
+
+- **webdataset** (default): MINT-style tars via :class:`WebdatasetReaderStage` in
+  ``preview_annotation_standalone`` (annotation from ``mint1t_annotation_pipeline``).
+- **omnicorpus**: OmniCorpus-CC tars via :class:`OmniCorpusReaderStage` in
+  ``preview_annotation_standalone`` (annotation from ``omnicorpus_annotation_pipeline``).
+  Same stack as WebDataset preview: no ``nemo_curator`` or ``omni_corpus_annotation`` imports.
+"""
+
+from __future__ import annotations
 
 import argparse
 import base64
@@ -20,7 +31,6 @@ import html
 import http.server
 import io
 import json
-import os
 import socketserver
 import sys
 import urllib.parse
@@ -35,7 +45,7 @@ if str(_script_dir) not in sys.path:
     sys.path.insert(0, str(_script_dir))
 
 try:
-    from PIL import Image  # noqa: E402
+    from PIL import Image
 except ImportError:
     Image = None
 
@@ -45,6 +55,7 @@ from preview_annotation_standalone import (  # noqa: E402
     FileGroupTask,
     InterleavedBatch,
     WebdatasetReaderStage,
+    collect_omnicorpus_kept_filtered_chunks,
     get_all_file_paths_under,
     materialize_task_binary_content,
 )
@@ -187,6 +198,10 @@ def _collect_kept_and_filtered(
     max_tars: int,
     limit_samples: int,
     num_workers: int,
+    *,
+    input_source: str = "webdataset",
+    include_general_metadata: bool = True,
+    omni_max_batch_bytes: int | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     read_kwargs = read_kwargs or {}
     kept_set = _load_kept_set(annotation_path, read_kwargs.get("storage_options"), num_workers)
@@ -207,7 +222,17 @@ def _collect_kept_and_filtered(
     kept_chunks: list[pd.DataFrame] = []
     filtered_chunks: list[pd.DataFrame] = []
 
-    if num_workers <= 1:
+    if input_source == "omnicorpus":
+        kept_chunks, filtered_chunks = collect_omnicorpus_kept_filtered_chunks(
+            paths,
+            read_kwargs,
+            kept_set,
+            limit_samples,
+            num_workers,
+            include_general_metadata,
+            omni_max_batch_bytes,
+        )
+    elif num_workers <= 1:
         reader = WebdatasetReaderStage(
             source_id_field="pdf_name",
             read_kwargs=read_kwargs,
@@ -398,7 +423,7 @@ def _row_to_html(row: pd.Series, index: int, kind: str) -> str:
             if scaled is not None:
                 thumb_b, ct = scaled
                 b64 = base64.b64encode(thumb_b).decode("ascii")
-                parts.append(f"<img src=\"data:{ct};base64,{b64}\" alt=\"image\" />")
+                parts.append(f'<img src="data:{ct};base64,{b64}" alt="image" />')
             else:
                 parts.append("<span class='noimg'>[image not loaded or invalid]</span>")
         else:
@@ -461,8 +486,7 @@ def _build_detail_html(sid: str, k: pd.DataFrame, f: pd.DataFrame) -> str:
 def _build_main_html(kept_df: pd.DataFrame, filtered_df: pd.DataFrame) -> str:
     sample_ids = sorted(
         pd.unique(
-            list(kept_df["sample_id"].dropna().astype(str))
-            + list(filtered_df["sample_id"].dropna().astype(str))
+            list(kept_df["sample_id"].dropna().astype(str)) + list(filtered_df["sample_id"].dropna().astype(str))
         ).tolist()
     )
     all_kept: list[str] = []
@@ -483,7 +507,9 @@ def _build_main_html(kept_df: pd.DataFrame, filtered_df: pd.DataFrame) -> str:
             f = filtered_df[filtered_df["sample_id"].astype(str) == sid]
             sid_esc = html.escape(sid)
             link = "/?sample=" + urllib.parse.quote(sid, safe="")
-            out.append(f"    <tr><td>{sid_esc}</td><td>{len(k)}</td><td>{len(f)}</td><td><a href=\"{html.escape(link)}\">Details</a></td></tr>")
+            out.append(
+                f'    <tr><td>{sid_esc}</td><td>{len(k)}</td><td>{len(f)}</td><td><a href="{html.escape(link)}">Details</a></td></tr>'
+            )
         return "\n".join(out) if out else "    <tr><td colspan='4'>None</td></tr>"
 
     all_kept_body = table_rows(all_kept)
@@ -498,7 +524,7 @@ def _build_main_html(kept_df: pd.DataFrame, filtered_df: pd.DataFrame) -> str:
 </head>
 <body>
   <h1>Preview: {len(sample_ids)} samples ({len(kept_df)} kept, {len(filtered_df)} filtered rows)</h1>
-  <p>Kept/filtered from annotation-path (sample_id, position). Data from original WebDataset. Click Details for per-sample rows.</p>
+  <p>Kept/filtered from annotation-path (sample_id, position). Data from original shards. Click Details for per-sample rows.</p>
   <h2 class="section-head">Samples with all kept ({len(all_kept)} samples)</h2>
   <p class="section-desc">No rows filtered out for these samples.</p>
   <table class="summary-table">
@@ -523,8 +549,40 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Web server showing kept vs filtered rows by sample_id (default: 10 samples)"
     )
-    parser.add_argument("--input-path", type=str, required=True, help="Original WebDataset tar path or directory")
-    parser.add_argument("--annotation-path", type=str, required=True, help="Annotation parquet dir (from mint1t_annotation_pipeline)")
+    parser.add_argument(
+        "--input-path",
+        type=str,
+        required=True,
+        help="Original tar path or directory (format depends on --input-source)",
+    )
+    parser.add_argument(
+        "--annotation-path",
+        type=str,
+        required=True,
+        help="Annotation parquet dir (from mint1t_annotation_pipeline or omnicorpus_annotation_pipeline)",
+    )
+    parser.add_argument(
+        "--input-source",
+        type=str,
+        choices=("webdataset", "omnicorpus"),
+        default="webdataset",
+        help=(
+            "Shard format: webdataset=MINT-style json+image members; "
+            "omnicorpus=OmniCorpus-CC (.json_image_text + .images pickle via preview_annotation_standalone)."
+        ),
+    )
+    parser.add_argument(
+        "--include-general-metadata",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="OmniCorpus only: join url/safety fields from .general_metadata.pkl (matches omnicorpus_annotation_pipeline default).",
+    )
+    parser.add_argument(
+        "--omni-max-batch-bytes",
+        type=int,
+        default=None,
+        help="OmniCorpus only: passed to OmniCorpusReaderStage.max_batch_bytes (default: None = one batch per tar).",
+    )
     parser.add_argument("--port", type=int, default=8080, help="Port for HTTP server")
     parser.add_argument(
         "--storage-options-json",
@@ -532,7 +590,12 @@ def main() -> None:
         default=None,
         help="JSON-encoded fsspec storage options for cloud paths",
     )
-    parser.add_argument("--max-samples", type=int, default=LIMIT_SAMPLES, help="Max samples per list: all-kept and with-filtered (default: 50)")
+    parser.add_argument(
+        "--max-samples",
+        type=int,
+        default=LIMIT_SAMPLES,
+        help="Max samples per list: all-kept and with-filtered (default: 50)",
+    )
     parser.add_argument("--max-tars", type=int, default=MAX_TARS, help="Max tar files to scan")
     default_workers = 16
     parser.add_argument(
@@ -558,19 +621,27 @@ def main() -> None:
         max_tars=args.max_tars,
         limit_samples=args.max_samples,
         num_workers=workers,
+        input_source=args.input_source,
+        include_general_metadata=args.include_general_metadata,
+        omni_max_batch_bytes=args.omni_max_batch_bytes,
     )
     if kept_df.empty and filtered_df.empty:
-        print("No content rows found. Check --input-path and that tars contain WebDataset samples.")
+        hint = (
+            "OmniCorpus shards (.json_image_text)."
+            if args.input_source == "omnicorpus"
+            else "WebDataset samples (json + image members)."
+        )
+        print(f"No content rows found. Check --input-path and that tars contain {hint}")
         return
 
-    kept_df = _materialize_rows_parallel(kept_df, read_kwargs, workers)
-    filtered_df = _materialize_rows_parallel(filtered_df, read_kwargs, workers)
+    if args.input_source == "webdataset":
+        kept_df = _materialize_rows_parallel(kept_df, read_kwargs, workers)
+        filtered_df = _materialize_rows_parallel(filtered_df, read_kwargs, workers)
 
     main_html = _build_main_html(kept_df, filtered_df)
     sample_ids = sorted(
         pd.unique(
-            list(kept_df["sample_id"].dropna().astype(str))
-            + list(filtered_df["sample_id"].dropna().astype(str))
+            list(kept_df["sample_id"].dropna().astype(str)) + list(filtered_df["sample_id"].dropna().astype(str))
         ).tolist()
     )
     detail_html_by_id: dict[str, str] = {}
