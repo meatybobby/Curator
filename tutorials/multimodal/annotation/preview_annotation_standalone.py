@@ -955,7 +955,7 @@ class OmniCorpusReaderStage:
 
                         rows.extend(self._rows_from_sample(doc_id, tar_path, content_data, member_info, general_meta))
             except (OSError, tarfile.TarError) as exc:
-                logger.error("Failed to read tar %s: %s", tar_path, exc)
+                logger.exception("Failed to read tar %s: %s", tar_path, exc)
 
         if rows:
             table = pa.Table.from_pylist(rows)
@@ -1228,12 +1228,202 @@ def _tar_extract_omnicorpus_pickle(
         return None
 
 
+def _materialize_omnicorpus_one_range_key(
+    key: tuple[str, int, int],
+    blob: object,
+    rows: list[tuple[int, str, str]],
+    fs_path_cache: dict[str, str],
+) -> tuple[list[tuple[int, bytes | None, str | None]], list[tuple[tuple[str, str], tuple[int, str]]]]:
+    """Return (direct row updates, tar-fallback entries) for one cat_ranges blob."""
+    tar_path_orig = next((p for p, fp in fs_path_cache.items() if fp == key[0]), key[0])
+    direct: list[tuple[int, bytes | None, str | None]] = []
+    fallback: list[tuple[tuple[str, str], tuple[int, str]]] = []
+
+    if isinstance(blob, Exception) or blob is None or len(blob) == 0:
+        for idx, member_str, image_id in rows:
+            fallback.append(((tar_path_orig, member_str), (idx, image_id)))
+        return direct, fallback
+
+    try:
+        raw = bytes(blob) if not isinstance(blob, bytes) else blob
+        images_dict = pickle.loads(raw)
+    except Exception:
+        for idx, _member_str, _image_id in rows:
+            direct.append((idx, None, "pickle decode failed"))
+        return direct, fallback
+
+    if not isinstance(images_dict, dict):
+        for idx, _member_str, _image_id in rows:
+            direct.append((idx, None, "pickle did not decode to dict"))
+        return direct, fallback
+
+    for idx, _member_str, image_id in rows:
+        image_bytes = images_dict.get(image_id)
+        if image_bytes is not None:
+            direct.append((idx, image_bytes, None))
+        else:
+            direct.append((idx, None, f"image_id '{image_id}' not found in pickle"))
+    return direct, fallback
+
+
+def _split_list_for_workers(items: list[Any], max_workers: int) -> list[list[Any]]:
+    if not items:
+        return []
+    n = min(max(1, max_workers), len(items))
+    base, rem = divmod(len(items), n)
+    out: list[list[Any]] = []
+    start = 0
+    for i in range(n):
+        sz = base + (1 if i < rem else 0)
+        out.append(items[start : start + sz])
+        start += sz
+    return out
+
+
+def _partial_merge_range_pairs(
+    pairs: list[
+        tuple[
+            list[tuple[int, bytes | None, str | None]],
+            list[tuple[tuple[str, str], tuple[Any, str]]],
+        ]
+    ],
+) -> tuple[list[tuple[tuple[str, str], tuple[Any, str]]], dict[Any, bytes], dict[Any, str]]:
+    all_fb: list[tuple[tuple[str, str], tuple[Any, str]]] = []
+    ok: dict[Any, bytes] = {}
+    err: dict[Any, str] = {}
+    for direct, fallback in pairs:
+        all_fb.extend(fallback)
+        for idx, content, er in direct:
+            if content is not None:
+                ok[idx] = content
+            else:
+                err[idx] = er
+    return all_fb, ok, err
+
+
+def _merge_partial_range_parts(
+    parts: list[tuple[list[tuple[tuple[str, str], tuple[Any, str]]], dict[Any, bytes], dict[Any, str]]],
+) -> tuple[list[tuple[tuple[str, str], tuple[Any, str]]], dict[Any, bytes], dict[Any, str]]:
+    all_fb: list[tuple[tuple[str, str], tuple[Any, str]]] = []
+    ok: dict[Any, bytes] = {}
+    err: dict[Any, str] = {}
+    for fb, o, e in parts:
+        all_fb.extend(fb)
+        ok.update(o)
+        err.update(e)
+    return all_fb, ok, err
+
+
+def _extend_tar_fallbacks(
+    tar_extract_groups: defaultdict[tuple[str, str], list[tuple[Any, str]]],
+    fallbacks: list[tuple[tuple[str, str], tuple[Any, str]]],
+) -> None:
+    for gkey, gitem in fallbacks:
+        tar_extract_groups[gkey].append(gitem)
+
+
+def _apply_omnicorpus_direct_maps_to_df(
+    df: pd.DataFrame,
+    ok: dict[Any, bytes],
+    err: dict[Any, str],
+) -> tuple[int, int]:
+    if ok:
+        s_ok = pd.Series(ok, dtype=object)
+        df.loc[s_ok.index, "binary_content"] = s_ok
+        df.loc[s_ok.index, "materialize_error"] = None
+    if err:
+        s_err = pd.Series(err, dtype=object)
+        df.loc[s_err.index, "materialize_error"] = s_err
+    return len(ok), len(err)
+
+
+def _omnicorpus_parse_row_for_materialize(
+    idx: Any,
+    df: pd.DataFrame,
+    parsed_df: pd.DataFrame,
+) -> tuple[Any, str, tuple[Any, ...]]:
+    """Classify one image row for OmniCorpus materialization (no I/O)."""
+    path = parsed_df.loc[idx, "path"]
+    member = parsed_df.loc[idx, "member"]
+    if not path or not member:
+        return (idx, "err", ("missing path or member in source_ref",))
+    image_id = str(df.loc[idx, "image_id"]) if "image_id" in df.columns and pd.notna(df.loc[idx, "image_id"]) else ""
+    offset = parsed_df.loc[idx, "byte_offset"]
+    size = parsed_df.loc[idx, "byte_size"]
+    path_str = str(path)
+    member_str = str(member)
+    if offset is not None and size is not None and int(size) > 0:
+        return (idx, "rng", (path_str, int(offset), int(size), member_str, image_id))
+    return (idx, "tar", (path_str, member_str, image_id))
+
+
+def _omnicorpus_merge_classified_into_groups(
+    events: list[tuple[Any, str, tuple[Any, ...]]],
+    df: pd.DataFrame,
+    storage_options: dict[str, object],
+    range_groups: dict[tuple[str, int, int], list[tuple[int, str, str]]],
+    tar_extract_groups: dict[tuple[str, str], list[tuple[int, str]]],
+) -> tuple[fsspec.AbstractFileSystem | None, dict[str, str]]:
+    """Apply classified rows in order, filling range/tar groups (matches sequential fs state)."""
+    fs: fsspec.AbstractFileSystem | None = None
+    fs_path_cache: dict[str, str] = {}
+    for idx, kind, payload in events:
+        if kind == "err":
+            df.at[idx, "materialize_error"] = str(payload[0])
+            continue
+        if kind == "rng":
+            path_str, off, sz, member_str, image_id = payload
+            if fs is None:
+                try:
+                    fs, _ = url_to_fs(path_str, **storage_options)
+                except (ValueError, OSError):
+                    fs = None
+            if fs is not None:
+                if path_str not in fs_path_cache:
+                    _, fs_path_cache[path_str] = url_to_fs(path_str, **storage_options)
+                range_key = (fs_path_cache[path_str], off, sz)
+                range_groups[range_key].append((idx, member_str, image_id))
+            else:
+                tar_extract_groups[(path_str, member_str)].append((idx, image_id))
+        else:
+            path_str, member_str, image_id = payload
+            tar_extract_groups[(path_str, member_str)].append((idx, image_id))
+    return fs, fs_path_cache
+
+
+def _materialize_omnicorpus_one_tar_extract(
+    tar_path: str,
+    member_name: str,
+    row_entries: list[tuple[int, str]],
+    storage_options: dict[str, object],
+) -> list[tuple[int, bytes | None, str | None]]:
+    images_dict = _tar_extract_omnicorpus_pickle(tar_path, member_name, storage_options)
+    updates: list[tuple[int, bytes | None, str | None]] = []
+    if images_dict is None or not isinstance(images_dict, dict):
+        err = f"failed to load pickle from '{member_name}'"
+        for idx, _image_id in row_entries:
+            updates.append((idx, None, err))
+        return updates
+    for idx, image_id in row_entries:
+        image_bytes = images_dict.get(image_id)
+        if image_bytes is not None:
+            updates.append((idx, image_bytes, None))
+        else:
+            updates.append((idx, None, f"image_id '{image_id}' not found in pickle"))
+    return updates
+
+
 def materialize_omnicorpus_binary_content(
     task: InterleavedBatch,
     *,
     io_kwargs: dict[str, object] | None = None,
+    num_workers: int = 1,
 ) -> InterleavedBatch:
-    """Fill ``binary_content`` for OmniCorpus image rows from ``.images`` pickle members."""
+    """Fill ``binary_content`` for OmniCorpus image rows from ``.images`` pickle members.
+
+    When ``num_workers`` > 1, per-row parsing into range/tar groups may use a thread pool; merge keeps
+    row order. Range-read pickle decode and tar-extract fallback also use a thread pool when enabled.
+    """
     df = task.to_pandas().copy()
     if df.empty:
         return task
@@ -1250,39 +1440,24 @@ def materialize_omnicorpus_binary_content(
     range_groups: dict[tuple[str, int, int], list[tuple[int, str, str]]] = defaultdict(list)
     tar_extract_groups: dict[tuple[str, str], list[tuple[int, str]]] = defaultdict(list)
 
-    fs = None
-    fs_path_cache: dict[str, str] = {}
+    nw = max(1, num_workers)
+    indices = list(parsed_df.index)
+    order_rank = {idx: i for i, idx in enumerate(indices)}
 
-    for idx in parsed_df.index:
-        path = parsed_df.loc[idx, "path"]
-        member = parsed_df.loc[idx, "member"]
-        if not path or not member:
-            df.at[idx, "materialize_error"] = "missing path or member in source_ref"
-            continue
+    if nw <= 1 or len(indices) <= 1:
+        events = [_omnicorpus_parse_row_for_materialize(i, df, parsed_df) for i in indices]
+    else:
+        w = min(nw, len(indices))
 
-        image_id = (
-            str(df.loc[idx, "image_id"]) if "image_id" in df.columns and pd.notna(df.loc[idx, "image_id"]) else ""
-        )
-        offset = parsed_df.loc[idx, "byte_offset"]
-        size = parsed_df.loc[idx, "byte_size"]
-        path_str = str(path)
-        member_str = str(member)
+        def _parse_one(i: Any) -> tuple[Any, str, tuple[Any, ...]]:
+            return _omnicorpus_parse_row_for_materialize(i, df, parsed_df)
 
-        if offset is not None and size is not None and int(size) > 0:
-            if fs is None:
-                try:
-                    fs, _ = url_to_fs(path_str, **storage_options)
-                except (ValueError, OSError):
-                    fs = None
-
-            if fs is not None:
-                if path_str not in fs_path_cache:
-                    _, fs_path_cache[path_str] = url_to_fs(path_str, **storage_options)
-                range_key = (fs_path_cache[path_str], int(offset), int(size))
-                range_groups[range_key].append((idx, member_str, image_id))
-                continue
-
-        tar_extract_groups[(path_str, member_str)].append((idx, image_id))
+        with ThreadPoolExecutor(max_workers=w) as ex:
+            events = list(ex.map(_parse_one, indices))
+    events.sort(key=lambda e: order_rank[e[0]])
+    fs, fs_path_cache = _omnicorpus_merge_classified_into_groups(
+        events, df, storage_options, range_groups, tar_extract_groups
+    )
 
     materialized = 0
     errors = 0
@@ -1299,59 +1474,64 @@ def materialize_omnicorpus_binary_content(
             logger.warning("cat_ranges failed (%d ranges): %s", len(range_keys), exc)
             blobs = [exc] * len(range_keys)
 
-        for key, blob in zip(range_keys, blobs, strict=True):
-            rows = range_groups[key]
+        if nw <= 1 or len(range_keys) <= 1:
+            range_pairs = [
+                _materialize_omnicorpus_one_range_key(key, blob, range_groups[key], fs_path_cache)
+                for key, blob in zip(range_keys, blobs, strict=True)
+            ]
+        else:
+            w = min(nw, len(range_keys))
+            with ThreadPoolExecutor(max_workers=w) as ex:
+                futs = [
+                    ex.submit(_materialize_omnicorpus_one_range_key, key, blob, range_groups[key], fs_path_cache)
+                    for key, blob in zip(range_keys, blobs, strict=True)
+                ]
+                range_pairs = [fu.result() for fu in futs]
 
-            if isinstance(blob, Exception) or blob is None or len(blob) == 0:
-                for idx, member_str, image_id in rows:
-                    tar_path_orig = next((p for p, fp in fs_path_cache.items() if fp == key[0]), key[0])
-                    tar_extract_groups[(tar_path_orig, member_str)].append((idx, image_id))
-                continue
-
-            try:
-                raw = bytes(blob) if not isinstance(blob, bytes) else blob
-                images_dict = pickle.loads(raw)
-            except Exception:
-                for idx, member_str, image_id in rows:
-                    df.at[idx, "materialize_error"] = "pickle decode failed"
-                    errors += 1
-                continue
-
-            if not isinstance(images_dict, dict):
-                for idx, member_str, image_id in rows:
-                    df.at[idx, "materialize_error"] = "pickle did not decode to dict"
-                    errors += 1
-                continue
-
-            for idx, _member_str, image_id in rows:
-                image_bytes = images_dict.get(image_id)
-                if image_bytes is not None:
-                    df.at[idx, "binary_content"] = image_bytes
-                    df.at[idx, "materialize_error"] = None
-                    materialized += 1
-                else:
-                    df.at[idx, "materialize_error"] = f"image_id '{image_id}' not found in pickle"
-                    errors += 1
+        nmerge = min(nw, max(1, len(range_pairs)))
+        merge_chunks = _split_list_for_workers(range_pairs, nmerge)
+        if len(merge_chunks) <= 1:
+            all_fb, ok_map, err_map = _partial_merge_range_pairs(range_pairs)
+        else:
+            with ThreadPoolExecutor(max_workers=len(merge_chunks)) as ex_merge:
+                merge_parts = list(ex_merge.map(_partial_merge_range_pairs, merge_chunks))
+            all_fb, ok_map, err_map = _merge_partial_range_parts(merge_parts)
+        _extend_tar_fallbacks(tar_extract_groups, all_fb)
+        m_inc, e_inc = _apply_omnicorpus_direct_maps_to_df(df, ok_map, err_map)
+        materialized += m_inc
+        errors += e_inc
 
     if tar_extract_groups:
         logger.info("Falling back to tar-extract for %d pickle members", len(tar_extract_groups))
-        for (tar_path, member_name), row_entries in tar_extract_groups.items():
-            images_dict = _tar_extract_omnicorpus_pickle(tar_path, member_name, storage_options)
-            if images_dict is None or not isinstance(images_dict, dict):
-                for idx, image_id in row_entries:
-                    df.at[idx, "materialize_error"] = f"failed to load pickle from '{member_name}'"
-                    errors += 1
-                continue
-
-            for idx, image_id in row_entries:
-                image_bytes = images_dict.get(image_id)
-                if image_bytes is not None:
-                    df.at[idx, "binary_content"] = image_bytes
-                    df.at[idx, "materialize_error"] = None
-                    materialized += 1
-                else:
-                    df.at[idx, "materialize_error"] = f"image_id '{image_id}' not found in pickle"
-                    errors += 1
+        tar_items = list(tar_extract_groups.items())
+        if nw <= 1 or len(tar_items) <= 1:
+            for (tar_path, member_name), row_entries in tar_items:
+                for idx, content, err in _materialize_omnicorpus_one_tar_extract(
+                    tar_path, member_name, row_entries, storage_options
+                ):
+                    if content is not None:
+                        df.at[idx, "binary_content"] = content
+                        df.at[idx, "materialize_error"] = None
+                        materialized += 1
+                    else:
+                        df.at[idx, "materialize_error"] = err
+                        errors += 1
+        else:
+            tw = min(nw, len(tar_items))
+            with ThreadPoolExecutor(max_workers=tw) as ex:
+                futs = [
+                    ex.submit(_materialize_omnicorpus_one_tar_extract, tp, mn, entries, storage_options)
+                    for (tp, mn), entries in tar_items
+                ]
+                for fut in as_completed(futs):
+                    for idx, content, err in fut.result():
+                        if content is not None:
+                            df.at[idx, "binary_content"] = content
+                            df.at[idx, "materialize_error"] = None
+                            materialized += 1
+                        else:
+                            df.at[idx, "materialize_error"] = err
+                            errors += 1
 
     logger.info(
         "OmniCorpus materialization: %d/%d images materialized, %d errors",
@@ -1410,6 +1590,7 @@ def _read_one_tar_omnicorpus_kept_filtered(
     kept_set: set[tuple[str, int]],
     include_general_metadata: bool,
     max_batch_bytes: int | None,
+    omni_materialize_workers: int,
 ) -> tuple[int, pd.DataFrame, pd.DataFrame]:
     reader = OmniCorpusReaderStage(
         max_batch_bytes=max_batch_bytes,
@@ -1427,7 +1608,11 @@ def _read_one_tar_omnicorpus_kept_filtered(
     kept_parts: list[pd.DataFrame] = []
     filtered_parts: list[pd.DataFrame] = []
     for batch in batches:
-        mat = materialize_omnicorpus_binary_content(batch, io_kwargs=read_kwargs)
+        mat = materialize_omnicorpus_binary_content(
+            batch,
+            io_kwargs=read_kwargs,
+            num_workers=max(1, omni_materialize_workers),
+        )
         df = mat.to_pandas()
         if df.empty:
             continue
@@ -1449,10 +1634,12 @@ def collect_omnicorpus_kept_filtered_chunks(
     num_workers: int,
     include_general_metadata: bool,
     omni_max_batch_bytes: int | None,
+    omni_materialize_workers: int = 1,
 ) -> tuple[list[pd.DataFrame], list[pd.DataFrame]]:
     """Scan OmniCorpus tars and return lists of kept / filtered content row frames (for preview server)."""
     kept_chunks: list[pd.DataFrame] = []
     filtered_chunks: list[pd.DataFrame] = []
+    mat_w = max(1, omni_materialize_workers)
 
     if num_workers <= 1:
         reader = OmniCorpusReaderStage(
@@ -1471,7 +1658,11 @@ def collect_omnicorpus_kept_filtered_chunks(
             out = reader.process(task)
             batches = out if isinstance(out, list) else [out]
             for batch in batches:
-                mat = materialize_omnicorpus_binary_content(batch, io_kwargs=read_kwargs)
+                mat = materialize_omnicorpus_binary_content(
+                    batch,
+                    io_kwargs=read_kwargs,
+                    num_workers=mat_w,
+                )
                 df = mat.to_pandas()
                 if df.empty:
                     continue
@@ -1512,6 +1703,7 @@ def collect_omnicorpus_kept_filtered_chunks(
                     kept_set,
                     include_general_metadata,
                     omni_max_batch_bytes,
+                    1,
                 ): i
                 for i, tar_path in enumerate(paths)
             }

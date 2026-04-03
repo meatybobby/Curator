@@ -84,8 +84,16 @@ class InterleavedCLIPScoreExportStage(InterleavedCLIPScoreFilterStage):
                 continue
             indices, images = [], []
             for idx, b in rows:
+                try:
+                    arr = image_bytes_to_array(b)
+                except Exception:
+                    continue
+                if arr is None:
+                    continue
                 indices.append(idx)
-                images.append(image_bytes_to_array(b))
+                images.append(arr)
+            if not images:
+                continue
             img_emb = self._model(images)
             text_emb = self._model.encode_text(texts)
             scores = img_emb @ text_emb.T

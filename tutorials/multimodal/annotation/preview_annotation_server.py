@@ -202,6 +202,7 @@ def _collect_kept_and_filtered(
     input_source: str = "webdataset",
     include_general_metadata: bool = True,
     omni_max_batch_bytes: int | None = None,
+    omni_materialize_workers: int = 1,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     read_kwargs = read_kwargs or {}
     kept_set = _load_kept_set(annotation_path, read_kwargs.get("storage_options"), num_workers)
@@ -231,6 +232,7 @@ def _collect_kept_and_filtered(
             num_workers,
             include_general_metadata,
             omni_max_batch_bytes,
+            omni_materialize_workers=max(1, omni_materialize_workers),
         )
     elif num_workers <= 1:
         reader = WebdatasetReaderStage(
@@ -492,7 +494,7 @@ def _build_main_html(kept_df: pd.DataFrame, filtered_df: pd.DataFrame) -> str:
     all_kept: list[str] = []
     has_filtered: list[str] = []
     for sid in sample_ids:
-        k = kept_df[kept_df["sample_id"].astype(str) == sid]
+        kept_df[kept_df["sample_id"].astype(str) == sid]
         f = filtered_df[filtered_df["sample_id"].astype(str) == sid]
         n_f = len(f)
         if n_f == 0:
@@ -583,6 +585,15 @@ def main() -> None:
         default=None,
         help="OmniCorpus only: passed to OmniCorpusReaderStage.max_batch_bytes (default: None = one batch per tar).",
     )
+    parser.add_argument(
+        "--omni-materialize-workers",
+        type=int,
+        default=16,
+        help=(
+            "OmniCorpus only: threads inside materialize_omnicorpus_binary_content when --workers 1 "
+            "(sequential tar scan). When --workers > 1 (parallel tar scan), materialize uses 1 thread per batch."
+        ),
+    )
     parser.add_argument("--port", type=int, default=8080, help="Port for HTTP server")
     parser.add_argument(
         "--storage-options-json",
@@ -614,6 +625,7 @@ def main() -> None:
         read_kwargs["storage_options"] = json.loads(args.storage_options_json)
 
     workers = max(1, args.workers)
+    omni_mat = 1 if workers > 1 else max(1, args.omni_materialize_workers)
     kept_df, filtered_df = _collect_kept_and_filtered(
         args.input_path,
         args.annotation_path,
@@ -624,6 +636,7 @@ def main() -> None:
         input_source=args.input_source,
         include_general_metadata=args.include_general_metadata,
         omni_max_batch_bytes=args.omni_max_batch_bytes,
+        omni_materialize_workers=omni_mat,
     )
     if kept_df.empty and filtered_df.empty:
         hint = (

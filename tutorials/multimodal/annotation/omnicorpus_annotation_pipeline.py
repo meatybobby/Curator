@@ -30,7 +30,7 @@ import argparse
 import json
 import uuid
 from dataclasses import dataclass
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 from fsspec.core import url_to_fs
 from omni_corpus_annotation.stages.materialize import OmniCorpusMaterializeStage
@@ -47,11 +47,13 @@ from nemo_curator.stages.interleaved.filter import (
     InterleavedImageToTextRatioFilterStage,
     InterleavedQRCodeFilterStage,
 )
-from nemo_curator.stages.interleaved.stages import BaseInterleavedFilterStage
 from nemo_curator.stages.interleaved.utils import resolve_storage_options
 from nemo_curator.tasks import InterleavedBatch
 from nemo_curator.utils.client_utils import is_remote_url
 from nemo_curator.utils.file_utils import check_output_mode
+
+if TYPE_CHECKING:
+    from nemo_curator.stages.interleaved.stages import BaseInterleavedFilterStage
 
 ANNOTATION_METADATA_KEY = "annotation"
 

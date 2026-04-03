@@ -110,10 +110,7 @@ def _stage_newly_filtered_plan(
         all_k = all_keys_per_stage[i]
         kept_i = kept_sets[i]
         n_total_filtered = len(all_k - kept_i)
-        if i == 0:
-            new_keys = all_k - kept_i
-        else:
-            new_keys = (kept_sets[i - 1] - kept_i) & all_k
+        new_keys = all_k - kept_i if i == 0 else kept_sets[i - 1] - kept_i & all_k
         picked = sorted(new_keys)[:per_stage]
         out.append((ann_dir, n_total_filtered, picked, len(all_k)))
     return out
@@ -210,6 +207,7 @@ def _read_one_tar_rows_and_image_count_omnicorpus(
     need: frozenset[tuple[str, int]],
     include_general_metadata: bool,
     max_batch_bytes: int | None,
+    omni_materialize_workers: int,
 ) -> tuple[int, int, dict[tuple[str, int], pd.Series]]:
     """Read one OmniCorpus tar: count image rows and collect needed content rows by key."""
     reader = OmniCorpusReaderStage(
@@ -228,7 +226,11 @@ def _read_one_tar_rows_and_image_count_omnicorpus(
     found: dict[tuple[str, int], pd.Series] = {}
     img_rows = 0
     for batch in batches:
-        mat = materialize_omnicorpus_binary_content(batch, io_kwargs=read_kwargs)
+        mat = materialize_omnicorpus_binary_content(
+            batch,
+            io_kwargs=read_kwargs,
+            num_workers=max(1, omni_materialize_workers),
+        )
         df = mat.to_pandas()
         if df.empty:
             continue
@@ -254,6 +256,7 @@ def _scan_tars_for_rows_and_image_count_omnicorpus(
     num_workers: int,
     include_general_metadata: bool,
     omni_max_batch_bytes: int | None,
+    omni_materialize_workers: int,
 ) -> tuple[dict[tuple[str, int], pd.Series], int]:
     """Single pass over OmniCorpus tars: merge rows for ``need_keys`` and sum image row counts."""
     if not paths:
@@ -264,7 +267,13 @@ def _scan_tars_for_rows_and_image_count_omnicorpus(
         total_img = 0
         for i, tar_path in enumerate(paths):
             _, nimg, part = _read_one_tar_rows_and_image_count_omnicorpus(
-                i, tar_path, read_kwargs, need, include_general_metadata, omni_max_batch_bytes
+                i,
+                tar_path,
+                read_kwargs,
+                need,
+                include_general_metadata,
+                omni_max_batch_bytes,
+                omni_materialize_workers,
             )
             total_img += nimg
             for k, row in part.items():
@@ -284,6 +293,7 @@ def _scan_tars_for_rows_and_image_count_omnicorpus(
                 need,
                 include_general_metadata,
                 omni_max_batch_bytes,
+                1,
             ): i
             for i, p in enumerate(paths)
         }
@@ -319,7 +329,7 @@ def _scale_image_fixed_height(b: bytes, height_px: int) -> tuple[bytes, str] | N
             w, h = img.size
             if h <= 0:
                 return None
-            new_w = max(1, int(round(w * height_px / h)))
+            new_w = max(1, round(w * height_px / h))
             resample = getattr(Image, "Resampling", Image).LANCZOS
             if (w, h) != (new_w, height_px):
                 img = img.resize((new_w, height_px), resample)
@@ -551,6 +561,15 @@ def main() -> None:
         help="OmniCorpus only: OmniCorpusReaderStage.max_batch_bytes (default: None).",
     )
     parser.add_argument(
+        "--omni-materialize-workers",
+        type=int,
+        default=16,
+        help=(
+            "OmniCorpus only: threads inside materialize_omnicorpus_binary_content when --workers 1. "
+            "When --workers > 1, materialize uses 1 thread per batch."
+        ),
+    )
+    parser.add_argument(
         "--annotation-pattern",
         type=str,
         required=True,
@@ -592,6 +611,7 @@ def main() -> None:
         read_kwargs["storage_options"] = json.loads(args.storage_options_json)
 
     workers = max(1, args.workers)
+    omni_mat = 1 if workers > 1 else max(1, args.omni_materialize_workers)
     per_stage = max(1, args.per_stage)
 
     annotation_dirs = _expand_annotation_dirs(args.annotation_pattern)
@@ -622,6 +642,7 @@ def main() -> None:
             workers,
             args.include_general_metadata,
             args.omni_max_batch_bytes,
+            omni_mat,
         )
     else:
         by_key, total_input_images = _scan_tars_for_rows_and_image_count(paths, read_kwargs, need_keys, workers)

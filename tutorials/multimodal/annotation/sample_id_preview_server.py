@@ -328,7 +328,7 @@ def main() -> None:
 
     if args.sample_id == "" or args.sample_id is None:
         print("Please provide a sample_id using --sample-id")
-        exit()
+        sys.exit()
 
     workers = max(1, args.workers)
     target_sid = str(args.sample_id)
